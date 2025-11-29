@@ -21,7 +21,6 @@ class TrendForecaster(nn.Module):
         # 3. 趋势预测头
         self.prediction_head = nn.Sequential(
             nn.Linear(configs.d_model, 1),  # 输入d_model维度特征
-            #nn.Sigmoid()  # 激活函数将输出压缩至0-1（涨的概率）
         )
     def forward(self, x_input, return_feature=False):
         # x_input 的形状: [Batch, SeqLen, d_model]
@@ -39,14 +38,12 @@ class TrendForecaster(nn.Module):
         # 取最后一个时间点的特征用于预测
         # [Batch, SeqLen, d_model] -> [Batch, d_model]
         last_timestep_features = trend_features[:, -1, :]
-        # 使用全连接层进行预测
-        # [Batch, d_model] -> [Batch, prediction_horizon]
+        # 仅计算 Logits (原始分数)
         prediction_logits = self.prediction_head(last_timestep_features)
-        #prediction = torch.sigmoid(prediction_logits)  # 变成 0-1 概率
 
         if return_feature:
-            # 返回 Logits 和特征
+            # 供 CausalShockNet 使用：返回 Logits 和惯性特征
             return prediction_logits, last_timestep_features
         else:
-            # 直接返回 Logits
+            # 供 run_trend_model 的 BCEWithLogitsLoss 使用：返回 Logits
             return prediction_logits

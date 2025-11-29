@@ -14,9 +14,59 @@ from data.trend_data_processor import (
     DEVICE,
     DATA_FOLDER
 )
-
 from model.BaseTrend_model import TrendForecaster
-# 1) Training loop (保持不变)
+
+
+# ---------------------------------------------------------
+# 1. 新增功能: 导出用于 ShockNet 的数据集 (pkl格式)
+# ---------------------------------------------------------
+def export_dataset_for_shocknet(dataset, output_path="data/cmin_price_label_data.pkl"):
+    """
+    将 Dataset 中的数据（特征、真实标签、因果基线、真实冲击、日期、Ticker）导出为 Pickle 文件，
+    供 Part 2 (ShockNet) 的 FinancialShockDataset 读取。
+    """
+    print(f"\n=== 正在导出用于 ShockNet 的价格与标签数据 ===")
+
+    # 确保输出目录存在
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+    data_list = []
+
+    try:
+        # 遍历数据集
+        # ⚠️ 注意: 这里依赖于您已经在 trend_data_processor.py 中修改了 Dataset 类，
+        # 使其返回 (x, y_actual, y_base, y_shock, date, ticker) 6个元素
+        print("正在转换数据格式 (可能需要几秒钟)...")
+        for item in dataset.data:
+            # 解包数据
+            x, y_act, y_base, y_shock, date, ticker = item
+
+            data_list.append({
+                'date': str(date.date()) if hasattr(date, 'date') else str(date),  # 格式化日期
+                'ticker': ticker,
+                'X_history': x.numpy(),  # 转为 numpy 保存以减小体积和通用性
+                'Y_Actual': y_act.item(),  # 真实涨跌 (0/1)
+                'Y_Base_Logits': y_base.item(),  # 惯性基线 Logits
+                'Y_Shock_Value': y_shock.item()  # 真实冲击值 (Raw Return)
+            })
+
+        df = pd.DataFrame(data_list)
+
+        # 保存为 Pickle
+        df.to_pickle(output_path)
+        print(f"✅ 导出成功! 文件已保存至: {output_path}")
+        print(f"   总样本数: {len(df)}")
+        print(f"   包含列名: {df.columns.tolist()}")
+
+    except ValueError as e:
+        print(f"❌ 导出失败: 数据集解包错误。")
+        print(f"   原因可能是 trend_data_processor.py 中的 Dataset 类尚未更新为返回 6 个元素。")
+        print(f"   错误详情: {e}")
+    except Exception as e:
+        print(f"❌ 导出过程中发生未知错误: {e}")
+# ---------------------------------------------------------
+# 2. 训练循环 (保持不变)
+# ---------------------------------------------------------
 def train_model(model, train_loader, val_loader, configs, epochs=50, learning_rate=1e-3):
     DEVICE = next(model.parameters()).device
     positive_weight = torch.tensor(0.908, dtype=torch.float32).to(DEVICE)
@@ -25,12 +75,12 @@ def train_model(model, train_loader, val_loader, configs, epochs=50, learning_ra
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
 
     best_f1 = -1
+    best_threshold_value = 0.5  # 初始化
 
     for epoch in range(epochs):
         model.train()
         train_loss_sum = 0
 
-        # --- 训练循环 ---
         for i, (X, y) in enumerate(train_loader):
             X = X.to(DEVICE)
             y = y.to(DEVICE).float()
@@ -43,7 +93,7 @@ def train_model(model, train_loader, val_loader, configs, epochs=50, learning_ra
 
         avg_train_loss = train_loss_sum / len(train_loader)
 
-        # --- 评估循环：收集所有结果 ---
+        # --- 评估 ---
         model.eval()
         all_probs = []
         all_targets = []
@@ -54,34 +104,21 @@ def train_model(model, train_loader, val_loader, configs, epochs=50, learning_ra
                 y = y.to(DEVICE).float()
                 logits = model(X)
                 pred_prob = torch.sigmoid(logits).view(-1)
-
                 all_probs.extend(pred_prob.cpu().numpy())
                 all_targets.extend(y.view(-1).cpu().numpy())
 
-        # !!! 关键修改: 将评估指标的计算移到循环外部 !!!
-
-        # 计算评估指标 (现在使用整个验证集的数据)
         val_metrics = evaluate_metrics(np.array(all_probs), np.array(all_targets))
 
-        # 打印日志
-        print(f"应用动态阈值: {val_metrics['threshold']:.4f}")
-        print(f"Epoch {epoch + 1}: TrainLoss={avg_train_loss:.6f} | "
-              f"ValAcc={val_metrics['accuracy']:.4f} | "
-              f"ValPrec={val_metrics['precision']:.4f} | "
-              f"ValRecall={val_metrics['recall']:.4f} | "
-              f"ValF1={val_metrics['f1']:.4f} | "
-              f"AUC={val_metrics['auc']:.4f} | "
-              f"MCC={val_metrics['mcc']:.4f}")
+        print(
+            f"Epoch {epoch + 1}: TrainLoss={avg_train_loss:.6f} | ValF1={val_metrics['f1']:.4f} | AUC={val_metrics['auc']:.4f}")
 
-
-        # 保存最优模型
         if val_metrics['f1'] > best_f1:
             best_f1 = val_metrics['f1']
-            best_threshold_value = val_metrics['threshold']  #记录当前最佳阈值
+            best_threshold_value = val_metrics['threshold']
             save_model(model, "best_direction_model.pth")
             print(f" 保存最优模型（F1={best_f1:.4f}）")
 
-    return model, best_threshold_value #返回模型和最佳阈值
+    return model, best_threshold_value
 
 
 # 2) 信号生成函数 (优化：接收已加载的数据集)
@@ -100,46 +137,36 @@ def generate_trend_scores(full_dataset, model_path="best_direction_model.pth", b
 
     model.eval()
 
-    # 准备 DataLoader，不需要 shuffle，用于全量推断
-    # 从传入的 full_dataset 中提取 Tensor
+    # 修改数据提取逻辑以适配 6 元素元组
     X_all = torch.stack([full_dataset.data[i][0] for i in range(len(full_dataset.data))])
-    y_all = torch.tensor([full_dataset.data[i][1] for i in range(len(full_dataset.data))],
-                         dtype=torch.float32).unsqueeze(-1)
+    # 只需要 X 用于预测，不需要 Y
 
-    all_loader = DataLoader(TensorDataset(X_all, y_all), batch_size=256, shuffle=False)
-
+    # 创建只包含 X 的 DataLoader
+    all_loader = DataLoader(TensorDataset(X_all), batch_size=256, shuffle=False)
     all_probs = []
 
-    # 2. 批量推断
     with torch.no_grad():
-        for X, _ in all_loader:
-            X = X.to(DEVICE)
-            # model(X) 现在返回的是 Logits
+        for batch in all_loader:
+            X = batch[0].to(DEVICE)
             logits = model(X)
-            # 显式计算概率
             pred_prob = torch.sigmoid(logits).view(-1)
             all_probs.extend(pred_prob.cpu().numpy())
 
-    # 3. 提取元数据 (日期和股票代码)
+    # 提取元数据 (日期和Ticker在第4和第5个位置)
+    # data item: (x, y_act, y_base, y_shock, date, ticker)
     metadata = full_dataset.data
 
-    #使用传入的最佳阈值生成二元信号
-    all_probs_np = np.array(all_probs)
-    predicted_signal = (all_probs_np > best_threshold).astype(int)
+    predicted_signal = (np.array(all_probs) > best_threshold).astype(int)
 
     df_scores = pd.DataFrame({
-        'Target_Date': [d[2] for d in metadata],
-        'Ticker': [d[3] for d in metadata],
+        'Target_Date': [d[4] for d in metadata],  # 注意索引变化：date 是 index 4
+        'Ticker': [d[5] for d in metadata],  # 注意索引变化：ticker 是 index 5
         'P_Trend': all_probs,
         'Signal': predicted_signal
     })
 
-    # 4. 保存结果
-    output_path = "trend_base_scores.csv"
-    df_scores.to_csv(output_path, index=False)
-    print(f"\n趋势信号生成完成！已保存到 {output_path}。")
-    print(f"使用的最佳动态阈值为: {best_threshold:.4f}")
-    print(f"总共 {len(df_scores)} 个信号已导出。")
+    df_scores.to_csv("trend_base_scores.csv", index=False)
+    print(f"趋势信号生成完成！")
     return df_scores
 
 
@@ -147,17 +174,27 @@ def generate_trend_scores(full_dataset, model_path="best_direction_model.pth", b
 if __name__ == "__main__":
     configs = Configs()
 
-    # 1. 初始化数据 (只加载一次)
+    # 1. 初始化数据 (加载 CSV，计算特征和标签)
+    # ⚠️ 此时 Dataset 应该已经包含了 Y_Base 和 Y_Shock 的计算逻辑
     dataset = Dataset(DATA_FOLDER, past_window=configs.seq_len)
+
+    # --- 【新增】步骤 1.5: 导出用于 ShockNet 的数据 ---
+    # 利用刚刚加载好的 dataset，直接导出，无需再次读取 CSV
+    export_dataset_for_shocknet(dataset, output_path="data/cmin_US_price_label_data.pkl")
+    # ---------------------------------------------------
+
+    # 2. 创建 DataLoader 用于 TrendNet 训练
+    # ⚠️ 确保 trend_data_processor.py 中的 create_loaders 函数
+    # 只提取 dataset.data[i][0] (X) 和 dataset.data[i][1] (y_actual)
     train_loader, val_loader, test_loader = create_loaders(dataset, batch_size=64)
 
-    # 2. 初始化模型
+    # 3. 初始化模型
     model = TrendForecaster(configs, prediction_horizon=1).to(DEVICE)
 
-    # 3. 运行训练
-    print(f"\n=== 开始训练 (设备: {DEVICE}) ===")
-    trained_model, best_threshold_value = train_model(model, train_loader, val_loader, configs, epochs=100, learning_rate=1e-3)
+    # 4. 运行训练
+    print(f"\n=== 开始 TrendNet 训练 (设备: {DEVICE}) ===")
+    trained_model, best_threshold_value = train_model(model, train_loader, val_loader, configs, epochs=100,
+                                                      learning_rate=1e-3)
 
-    # 4. 训练结束后，生成基础趋势分数
-    # 将加载好的 dataset 对象作为参数传入
+    # 5. 生成基础趋势分数
     generate_trend_scores(dataset, best_threshold=best_threshold_value)
