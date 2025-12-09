@@ -9,7 +9,7 @@ import numpy as np
 # 1) 配置数据路径和设备
 # -------------------------
 # 请根据您的实际路径修改 DATA_FOLDER
-DATA_FOLDER = "D:\\pythonbank\\Causal-ShockNet\\data\\CMIN-Dataset-main\\CMIN-US\\price\\raw"
+DATA_FOLDER = "/share/liuyuqing/causal_net/data/CMIN-Dataset-main/CMIN-US/price/raw"
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 
@@ -31,14 +31,24 @@ class Configs:
         self.d_ff = 64
 
         # --- PDM 模块参数 (仅作占位符) ---
+        self.channel_independence = 0
+        self.decomp_method = "dft_decomp"
+        self.top_k = 5
+        self.moving_avg = 3
         self.down_sampling_layers = 2
         self.down_sampling_window = 2
 
-        # --- 因果约束损失权重 ---
-        self.lambda_cf = 0.1  # 反事实约束损失 L_CF 权重
-        self.lambda_triplet = 0.1  # 因果三元组损失 L_Triplet 权重
-        self.margin = 0.5  # Triplet Loss 的 Margin
-        self.lambda_base = 0.5  # 基线损失权重
+        # --- 训练超参数 (新增) ---
+        self.weight_decay = 1e-5  # L2 正则化，对抗过拟合
+
+        # --- 因果约束损失权重 (改为动态配置)---
+        self.lambda_base = 0.5  # 基线损失权重 (保持不变)
+        self.margin = 1.0  # Triplet Loss 的 Margin，使约束更严格 (原 0.5)
+        self.lambda_ortho_start = 0.1  # 反事实约束损失 L_CF 权重
+        self.lambda_ortho_end = 1.0
+        self.lambda_triplet_start = 0.1  # 因果三元组损失 L_Triplet 权重
+        self.lambda_triplet_end = 1.0
+
 
 
 # 3) PDM 分解类 (作为模型架构的组成部分，保留)
@@ -51,7 +61,7 @@ class PDM:
         pass
 
 
-# 4) 数据集类 (Dataset) - ⚠️ 已修改以支持因果目标计算
+# 4) 数据集类 (Dataset) - ⚠️ 已修改以支持因果目标计算和全局排序
 class Dataset(Dataset):
     def __init__(self, folder, past_window=60):
         self.folder = folder
@@ -85,19 +95,15 @@ class Dataset(Dataset):
                 # 计算二分类标签 (Y_Actual) -> 用于 L_Pred
                 labels = np.where(ret_future > 0, 1, 0)
 
-                # --- 2. 因果目标计算 (新增的关键部分) ---
+                # --- 2. 因果目标计算 ---
                 # 计算长期 EMA (例如 60 天) 代表纯净惯性 -> 用于 L_Base
-                # 我们对“收益率”做 EMA，而不是价格，以保持平稳性
                 ret_series = pd.Series(ret_future)
-                # span=60 近似对应过去 60 天的平滑趋势
                 ema_ret = ret_series.ewm(span=60, adjust=False).mean().values
 
                 # 将 EMA 收益率转换为 Logits 形式的近似值
-                # 逻辑：EMA > 0 -> Logits > 0, EMA < 0 -> Logits < 0
-                # 这里使用 tanh * 缩放系数来模拟 logits 范围，使其适合 MSE Loss
                 y_base_logits = np.tanh(ema_ret * 100) * 5.0
 
-                # --- 3. 特征工程 (保持不变) ---
+                # --- 3. 特征工程 ---
                 base_features = df[["open", "high", "low", "close", "volume"]].ffill()
                 s1 = base_features.rolling(window=3, min_periods=1).mean()
                 s2 = base_features.rolling(window=7, min_periods=1).mean()
@@ -126,10 +132,10 @@ class Dataset(Dataset):
                     y_shock = torch.tensor(ret_future[t - 1], dtype=torch.float32)  # 真实收益数值
 
                     if 'date' in df.columns:
-                        target_date = df.iloc[t]['date']  # 这里的 t 对应 label 的时间
+                        # 这里的 t 对应 label 的时间
+                        target_date = df.iloc[t]['date']
                         ticker = os.path.basename(path).replace('.csv', '')
 
-                        # ⚠️ 关键修改：返回 6 个元素
                         # 存储扩充后的数据元组
                         self.data.append((x_tensor, y_actual, y_base, y_shock, target_date, ticker))
 
@@ -138,50 +144,52 @@ class Dataset(Dataset):
                 continue
         print(f"加载完成，样本总数: {len(self.data)}")
 
+        # 关键修正 A：按时间戳对所有股票数据进行全局排序
+        # x[4] 是 target_date (pd.Timestamp)
+        self.data.sort(key=lambda x: x[4])
+
     def __len__(self):
         return len(self.data)
 
     def __getitem__(self, idx):
-        # 保持与旧代码部分兼容：但在 create_loaders 中我们只取前两个
-        # 这里返回所有数据，供 Dataset 内部使用或调试
+        # 返回所有数据，供 DataLoader 使用
         return self.data[idx]
 
 
-# 5) Chronological split & DataLoader - ⚠️ 已修改以兼容 Dataset 的新返回值
+# 5) Chronological split & DataLoader - 修正后的版本
 def create_loaders(dataset, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, batch_size=64):
     total = len(dataset)
     train_end = int(total * train_ratio)
     val_end = train_end + int(total * val_ratio)
     idxs = np.arange(total)
 
-    # 按照索引顺序切分
+    # 关键修正 B：数据已在 Dataset 中全局按日期排序，此处按顺序切分索引
     train_idx = idxs[:train_end]
     val_idx = idxs[train_end:val_end]
     test_idx = idxs[val_end:]
 
-    # 将数据打包成 TensorDataset
-    # ⚠️ 关键修改：因为 dataset.data 现在包含 6 个元素，
-    # 而 TrendNet 训练只需要 X (index 0) 和 y_actual (index 1)。
-    # 我们只提取这两项来创建 TensorDataset，保证 run_trend_model.py 不会报错。
-
+    # 提取所有样本的 X 和 Y_actual
     X_all = torch.stack([dataset.data[i][0] for i in idxs])
     y_all = torch.tensor([dataset.data[i][1] for i in idxs], dtype=torch.float32).unsqueeze(-1)
 
-    train_ds = TensorDataset(X_all[train_idx], y_all[train_idx])
-    val_ds = TensorDataset(X_all[val_idx], y_all[val_idx])
-    test_ds = TensorDataset(X_all[test_idx], y_all[test_idx])
+    train_loader = DataLoader(TensorDataset(X_all[train_idx], y_all[train_idx]),
+                              batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(TensorDataset(X_all[val_idx], y_all[val_idx]),
+                            batch_size=batch_size, shuffle=False)
+    test_loader = DataLoader(TensorDataset(X_all[test_idx], y_all[test_idx]),
+                             batch_size=batch_size, shuffle=False)
 
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
-    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False)
+    print(f"数据集加载完成：总样本数={total}, 训练集={len(train_idx)}, 验证集={len(val_idx)}, 测试集={len(test_idx)}")
 
-    print(f"数据集加载完成：总样本数={total}, 训练集={len(train_ds)}, 验证集={len(val_ds)}, 测试集={len(test_ds)}")
+    #关键修正 C：打印划分的日期范围以进行最终验证
+    train_end_date = dataset.data[train_end - 1][4].strftime('%Y-%m-%d')
+    val_end_date = dataset.data[val_end - 1][4].strftime('%Y-%m-%d')
+    print(f"严格时间划分：训练集结束日期={train_end_date}, 验证集结束日期={val_end_date}")
+
     return train_loader, val_loader, test_loader
 
 
-# -------------------------
-# 6) Evaluation function
-# -------------------------
+# 6) Evaluation function (保持不变)
 def evaluate_metrics(all_probs, all_targets):
     """计算多维评估指标"""
     all_probs = np.array(all_probs)
@@ -233,7 +241,7 @@ def evaluate_metrics(all_probs, all_targets):
     }
 
 
-# 7) 辅助函数
+# 7) 辅助函数 (保持不变)
 def save_model(model, path):
     """保存模型权重"""
     torch.save(model.state_dict(), path)
